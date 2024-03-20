@@ -7,7 +7,7 @@
 
 ## Variational Autoencoder
 
-## Encoder
+### Encoder
 
 The encoder is a neural network responsible for taking the input data and compressing it into a lower-dimensional latent representation. This latent space captures the essential features of the data while discarding noise and redundancy.
 
@@ -119,7 +119,7 @@ The formula x = mean + stdev * noise is a direct consequence of the reparameteri
 <BR>
 <BR>
 
-## Decoder
+### Decoder
 
 The role of Decoder is to take the latent space representation and reconstructs the original data from it. Inside the I included Attention Block and Residual Block, so encoder can also use it.
   ```py
@@ -242,7 +242,7 @@ This last layer is for converting 128 channels into 3 channels (RGB).
         return x
   ```
 
-  We need reverse the scaling before we it into the decoder.
+  We need reverse the scaling before we send input into the decoder.
 
 
 ### Residual Block
@@ -328,7 +328,7 @@ techniques used for handling data shape changes in neural networks:
 
 <b>Non-linear activation functions</b> :
 
-<p align="center"><img src="assets\image.png"></p>
+<p align="center"><img src="assets\SiLU vs. ReLU.png"></p>
 
 - Advantages of SiLU over ReLU:
 
@@ -376,10 +376,134 @@ The view function is then applied to the q, k, and v tensors to reshape them int
         return output
   ```
 
+<br>
+<br>
+<br>
+
+## Clip Encoder
+
+A CLIP encoder is a specific part of a Contrastive Language-Image Pre-training (CLIP) model. CLIP models are designed to understand the relationship between text and images. There are actually two encoders within a CLIP model:
+
+- Text Encoder: This encoder takes text input, like a sentence or caption, and converts it into a numerical representation. This embedding captures the semantic meaning of the text.
+- Image Encoder: This encoder takes an image as input and transforms it into another numerical representation. This embedding captures the visual content of the image.
+
+However, in the Stable Diffusion primarily uses the CLIP text encoder. It focuses on using the encoded text description to refine noise into an image that aligns with the textual prompt.
+
+  ```py
+  class CLIPEmbedding(nn.Module):
+    def __init__(self, n_vocab: int, n_embd: int, n_token: int):
+        super().__init__()
+
+        self.token_embedding = nn.Embedding(n_vocab, n_embd)
+        # A learnable weight matrix encodes the position information for each token
+        self.position_embedding = nn.Parameter(torch.zeros((n_token, n_embd)))
+
+    def forward(self, tokens):
+        # (Batch_Size, Seq_Len) -> (Batch_Size, Seq_Len, Dim)
+        x = self.token_embedding(tokens)
+        # (Batch_Size, Seq_Len) -> (Batch_Size, Seq_Len, Dim)
+        x += self.position_embedding
+
+        return x
+  ```
+CLIPEmbedding Class assigns a dense vector to each word using a pre-trained layer, capturing its meaning, and add position to the word, then combine both embeddings and positions together.
+
+  ```py
+    class CLIPLayer(nn.Module):
+    def __init__(self, n_head: int, n_embd: int):
+        super().__init__()
+
+        # Pre-attention norm
+        self.layernorm_1 = nn.LayerNorm(n_embd)
+        # Self attention
+        self.attention = SelfAttention(n_head, n_embd)
+        # Pre-FNN norm
+        self.layernorm_2 = nn.LayerNorm(n_embd)
+        # Feedforward layer
+        self.linear_1 = nn.Linear(n_embd, 4 * n_embd)
+        self.linear_2 = nn.Linear(4 * n_embd, n_embd)
+
+    def forward(self, x):
+        # (Batch_Size, Seq_Len, Dim)
+        residue = x
+
+        ### SELF ATTENTION ###
+
+        # (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, Dim)
+        x = self.layernorm_1(x)
+
+        # (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, Dim)
+        x = self.attention(x, causal_mask=True)
+
+        # (Batch_Size, Seq_Len, Dim) + (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, Dim)
+        x += residue
+
+        ### FEEDFORWARD LAYER ###
+        # Apply a feedforward layer where the hidden dimension is 4 times the embedding dimension.
+
+        residue = x
+        # (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, Dim)
+        x = self.layernorm_2(x)
+
+        # (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, 4 * Dim)
+        x = self.linear_1(x)
+
+        # (Batch_Size, Seq_Len, 4 * Dim) -> (Batch_Size, Seq_Len, 4 * Dim)
+        x = x * torch.sigmoid(1.702 * x)  # QuickGELU activation function
+
+        # (Batch_Size, Seq_Len, 4 * Dim) -> (Batch_Size, Seq_Len, Dim)
+        x = self.linear_2(x)
+
+        # (Batch_Size, Seq_Len, Dim) + (Batch_Size, Seq_Len, Dim) -> (Batch_Size, Seq_Len, Dim)
+        x += residue
+
+        return x
+  ```
+Cliplayer has similar role to the encoder of transformer. It use self-Attetion to focus on important relationships between word in the text sequence. Using Feed-Forward Network to capture more complex aspects of the text's meaning by introducing non-linearity to the model. Futhermore, the reason why they normalize the data before attention block because they used technique called pre-norm Transformer which can sometimes achieve better performance compared to the original post-norm architecture.
+
+<br>
+<br>
+<br>
+
+## Diffusion Model (U-Net)
+
+  ```py
+    class Diffusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.time_embedding = TimeEmbedding(320)
+        self.unet = UNET()
+        self.final = UNET_OutputLayer(320, 4)
+
+    def forward(self, latent, context, time):
+        # latent: (Batch_Size, 4, Height / 8, Width / 8)
+        # context: (Batch_Size, Seq_Len, Dim)
+        # time: (1, 320)
+
+        # (1, 320) -> (1, 1280)
+        time = self.time_embedding(time)
+
+        # (Batch, 4, Height / 8, Width / 8) -> (Batch, 320, Height / 8, Width / 8)
+        output = self.unet(latent, context, time)
+
+        # (Batch, 320, Height / 8, Width / 8) -> (Batch, 4, Height / 8, Width / 8)
+        output = self.final(output)
+
+        # (Batch, 4, Height / 8, Width / 8)
+        return output
+  ```
+
+  ```py
+    self.time_embedding = TimeEmbedding(320)
+  ```
+We give the U-Net not only the noisified image but also the time Step At which it was notified so the image the U-Net needs some way to understand this time step so this is why this time step which is a number will be converted into an embedding by using this layer. 
+
+
+
 
 # Reference
 
-## Residual Block
+### Residual Block
 
 <https://medium.com/@neetu.sigger/a-comprehensive-guide-to-understanding-and-implementing-bottleneck-residual-blocks-6b420706f66b>
 <https://medium.com/analytics-vidhya/understanding-and-implementation-of-residual-networks-resnets-b80f9a507b9c>
@@ -390,3 +514,8 @@ The view function is then applied to the q, k, and v tensors to reshape them int
 
 <https://www.linkedin.com/pulse/understanding-batch-normalization-layer-group-implementing-pasha-s>
 <https://medium.com/@zljdanceholic/groupnorm-then-batchnorm-instancenorm-layernorm-e2b2a1d350a0>
+
+
+### Clip Model
+
+<https://sh-tsang.medium.com/review-pre-ln-transformer-on-layer-normalization-in-the-transformer-architecture-b6c91a89e9ab>
