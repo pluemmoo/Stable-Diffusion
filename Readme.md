@@ -322,9 +322,9 @@ techniques used for handling data shape changes in neural networks:
 
 #### GroupNorm vs. BatchNorm
 
-    1. Performance in Large Batch Sizes: For tasks where large batch sizes are feasible, BatchNorm often outperforms GroupNorm. This is especially observed in tasks like image classification on large datasets. But BatchNorm’s performance degrades with smaller batch sizes because the estimates of mean and variance become less accurate.
-    2. Generalization in Different Scenarios: GroupNorm tends to generalize better in certain non-i.i.d settings (e.g., when the data distribution changes across batches because they may not be from the same distribution, i.e. not identically distributed). In the Stable Diffusion official repo, you can find that GroupNorm is adopted instead of BatchNorm.
-    3. Computational Overhead: BatchNorm might introduce a slight computational overhead during inference due to the need for maintaining and using running statistics. GroupNorm, on the other hand, doesn’t have this requirement.
+1. Performance in Large Batch Sizes: For tasks where large batch sizes are feasible, BatchNorm often outperforms GroupNorm. This is especially observed in tasks like image classification on large datasets. But BatchNorm’s performance degrades with smaller batch sizes because the estimates of mean and variance become less accurate.
+2. Generalization in Different Scenarios: GroupNorm tends to generalize better in certain non-i.i.d settings (e.g., when the data distribution changes across batches because they may not be from the same distribution, i.e. not identically distributed). In the Stable Diffusion official repo, you can find that GroupNorm is adopted instead of BatchNorm.
+3. Computational Overhead: BatchNorm might introduce a slight computational overhead during inference due to the need for maintaining and using running statistics. GroupNorm, on the other hand, doesn’t have this requirement.
 
 <b>Non-linear activation functions</b> :
 
@@ -498,7 +498,24 @@ Cliplayer has similar role to the encoder of transformer. It use self-Attetion t
   ```
 We give the U-Net not only the noisified image but also the time Step At which it was notified so the image the U-Net needs some way to understand this time step so this is why this time step which is a number will be converted into an embedding by using this layer. [Implementation](#TimeEmbedding-Class)
 
-It just like the positional encoding off the Transformer model. This time tells the model at which step we arrived in the denoisification
+It just like the positional encoding of the Transformer model. This time tells the model at which step we arrived in the denoisification.
+
+Diffusion Process:
+
+- Stable diffusion works by gradually adding noise to an initial image (often pure noise) and then progressively removing it in a controlled manner.
+- This noise removal process is guided by a series of steps, each with a specific noise level.
+
+Time Embeddings as Step Information:
+
+- Time embeddings are vector representations that encode information about the current step within the noise removal schedule.
+- These embeddings are fed into the U-Net model alongside the image data itself.
+- By incorporating this information, the U-Net can learn how to remove noise effectively based on the specific stage of the diffusion process.
+
+Benefits of Time Embeddings:
+
+- Improved Control: Time embeddings provide the model with more precise control over the noise removal process at each step.
+- Stable Training: They can help the model learn a more stable and predictable way to remove noise, leading to better convergence during training.
+
 
    ```py
     def forward(self, latent, context, time):
@@ -680,7 +697,93 @@ The structure of the UNET is consist of Encoder, bottleneck, and Decoder:
 
 Similar to nn.Sequential, it takes an ordered list off layers as input during its initialization. During the forward pass, it iterates through this list, applying each layer's operation to the input data sequentially. It can recognize what are the parameters of each of them, and we'll apply accordingly.
 
+#### Residual Block
 
+For the Residual Block in the U-Net, it is similar to residual block in the VAE, but in this block they try to add the time embedding to the input.
+
+#### Attention Block
+
+  ```py
+    class AttentionBlock(nn.Module):
+    def __init__(self, n_head: int, n_embd: int, d_context=768):
+        super().__init__()
+        channels = n_head * n_embd
+        
+        self.groupnorm = nn.GroupNorm(32, channels, eps=1e-6)
+        self.conv_input = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+
+        self.layernorm_1 = nn.LayerNorm(channels)
+        self.attention_1 = SelfAttention(n_head, channels, in_proj_bias=False)
+        self.layernorm_2 = nn.LayerNorm(channels)
+        self.attention_2 = CrossAttention(n_head, channels, d_context, in_proj_bias=False)
+        self.layernorm_3 = nn.LayerNorm(channels)
+        self.linear_geglu_1  = nn.Linear(channels, 4 * channels * 2)
+        self.linear_geglu_2 = nn.Linear(4 * channels, channels)
+
+        self.conv_output = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+    
+    def forward(self, x, context):
+        residue_long = x
+
+        x = self.groupnorm(x)
+        x = self.conv_input(x)
+        
+        n, c, h, w = x.shape
+        x = x.view((n, c, h * w))   # (n, c, hw)
+        x = x.transpose(-1, -2)  # (n, hw, c)
+
+        residue_short = x
+        x = self.layernorm_1(x)
+        x = self.attention_1(x)
+        x += residue_short
+
+        residue_short = x
+        x = self.layernorm_2(x)
+        x = self.attention_2(x, context)
+        x += residue_short
+
+        residue_short = x
+        x = self.layernorm_3(x)
+        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
+        x = x * F.gelu(gate)
+        x = self.linear_geglu_2(x)
+        x += residue_short
+
+        x = x.transpose(-1, -2)  # (n, c, hw)
+        x = x.view((n, c, h, w))    # (n, c, h, w)
+
+        return self.conv_output(x) + residue_long
+  ```
+  
+Basically, we do layer normalize before sent the input into the self-attention block and do residual connection after it. Then, we gonna do similar thin again but in case, we use cross-attention block instead. After that, it go through feed forward layer which uses GeGLU function.
+
+  ```py
+    self.linear_geglu_1(x)
+  ```
+
+It uses to project the input features (x) to a higher dimension, essentially creating two separate feature spaces which are x and gate.
+
+- gate: holds one of the projected feature spaces. It's passed through the GELU (Gaussian Error Linear Unit) activation function, which introduces a smooth, non-zero slope for negative inputs.
+- x: holds another half of the projected feature spaces.
+
+   ```py
+    x = x * F.gelu(gate)
+  ```
+   This part introduces non-linearity. The erf function ensures a smooth, non-zero slope for negative inputs. After this, using linear layer to projects output back to a suitable format for further processing.
+
+
+
+#### GeGLU (Gated Linear Unit with GELU activation)
+
+Mathematical Properties and Advantages
+
+The nonlinear nature of GeGLU activations introduces a level of flexibility unseen in linear activation functions. This non-linearity allows neural networks to model complex, non-linear relationships in data, which is crucial for many real-world applications.
+
+This characteristic enables deep learning models to approximate virtually any function, embodying the Universal Approximation Theorem.
+
+Another advantage of GeGLU activations is their continuous differentiability. This property is important for gradient-based optimization algorithms, which are the backbone of most deep learning training processes. The smooth gradient of GeGLU activations can help these algorithms converge faster and more reliably.
+
+When juxtaposed with activation stalwarts like ReLU, GELU, Sigmoid, and Swish, GeGLU shines in its ability to balance range, nonlinearity, and training efficiency. This balance is crucial for the robust performance of neural networks across a plethora of tasks, from image recognition to language processing. (Gated Linear Unit with GELU activation)
 
 # Reference
 
@@ -718,3 +821,5 @@ U-Nets work on analyzing images for segmentation and feature extraction while ma
 So VAE is the model that tries to compress the data while also preserving the features of the data. But U-Net focuses on analyzing and attending to the data while maintaining image size. 
 
 
+### GeGLU
+<https://medium.com/@juanc.olamendy/unlocking-the-power-of-geglu-advanced-activation-functions-in-deep-learning-444868d6d89c>
