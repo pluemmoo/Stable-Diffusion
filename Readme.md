@@ -408,6 +408,8 @@ However, in the Stable Diffusion primarily uses the CLIP text encoder. It focuse
   ```
 CLIPEmbedding Class assigns a dense vector to each word using a pre-trained layer, capturing its meaning, and add position to the word, then combine both embeddings and positions together.
 
+In essence, the position_embedding initialize as zeros and model doesn't update it directly within a single forward pass. Instead, the framework calculates gradients for all trainable parameters during backpropagation, and these gradients guide the updates to self.position_embedding over many training iterations.
+
   ```py
     class CLIPLayer(nn.Module):
     def __init__(self, n_head: int, n_embd: int):
