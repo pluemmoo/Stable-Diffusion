@@ -496,8 +496,189 @@ Cliplayer has similar role to the encoder of transformer. It use self-Attetion t
   ```py
     self.time_embedding = TimeEmbedding(320)
   ```
-We give the U-Net not only the noisified image but also the time Step At which it was notified so the image the U-Net needs some way to understand this time step so this is why this time step which is a number will be converted into an embedding by using this layer. 
+We give the U-Net not only the noisified image but also the time Step At which it was notified so the image the U-Net needs some way to understand this time step so this is why this time step which is a number will be converted into an embedding by using this layer. [Implementation](#TimeEmbedding-Class)
 
+It just like the positional encoding off the Transformer model. This time tells the model at which step we arrived in the denoisification
+
+   ```py
+    def forward(self, latent, context, time):
+   ```
+
+- latent represents latent noise.
+- context represents the conditioning information for image generation.
+- time represents timestep.
+
+
+<a id="TimeEmbedding-Class"></a>
+
+### TimeEmbedding Class
+
+  ```py
+  class TimeEmbedding(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.linear_1 = nn.Linear(n_embd, 4 * n_embd)
+        self.linear_2 = nn.Linear(4 * n_embd, 4 * n_embd)
+
+    def forward(self, x):
+        # x: (1, 320)
+
+        # (1, 320) -> (1, 1280)
+        x = self.linear_1(x)
+
+        # (1, 1280) -> (1, 1280)
+        x = F.silu(x)
+
+        # (1, 1280) -> (1, 1280)
+        x = self.linear_2(x)
+
+        return x
+  ```
+
+For generating time embeddings, there are many approaches to implement it such as Linear Projection (We use this one), Sinusoidal Encodings, Learned Non-linear Embeddings, Recurrent Neural Networks (RNNs), and Rre-trained Embeddings. 
+
+The Reasons for using this implementation:
+
+-  Efficiency: Linear layers are computationally efficient, making this a suitable choice for real-time or resource-constrained applications. Since we use only 2 linear layers for increasing dimensionality, and using 1 non-linear for enhance the representation.
+-  Control over Embedding Dimensionality: The choice of 4 * n_embd allows for increasing the embedding size compared to the input, potentially capturing more complex temporal information.
+
+
+### UNET Class
+
+The structure of the UNET is consist of Encoder, bottleneck, and Decoder:
+
+#### Encoder
+
+  ```py
+        def __init__(self):
+        super().__init__()
+        self.encoders = nn.ModuleList([
+            # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(nn.Conv2d(4, 320, kernel_size=3, padding=1)),
+
+            # (Batch_Size, 320, Height / 8, Width / 8) -> # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
+
+            # (Batch_Size, 320, Height / 8, Width / 8) -> # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
+
+            # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 16, Width / 16)
+            SwitchSequential(nn.Conv2d(320, 320, kernel_size=3, stride=2, padding=1)),
+
+            # (Batch_Size, 320, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(320, 640), UNET_AttentionBlock(8, 80)),
+
+            # (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(640, 640), UNET_AttentionBlock(8, 80)),
+
+            # (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 32, Width / 32)
+            SwitchSequential(nn.Conv2d(640, 640, kernel_size=3, stride=2, padding=1)),
+
+            # (Batch_Size, 640, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(640, 1280), UNET_AttentionBlock(8, 160)),
+
+            # (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(1280, 1280), UNET_AttentionBlock(8, 160)),
+
+            # (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            SwitchSequential(nn.Conv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
+
+            # (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
+
+            # (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
+        ])
+  ```
+
+- The encoders module list consists of several SwitchSequential blocks.
+- These blocks contain either residual blocks or attention blocks, allowing the network to extract features from the input data at different resolutions.
+- After each encoder block, the feature maps are downsampled (reduced in size) to capture higher-level features.
+- The reasons that why we need to decrease the image size are:
+  - It aims to extract features of increasing complexity, but the side effect is a decrease in image size. This happens because these operations combine neighboring pixels into a single value, effectively reducing the spatial resolution of the image.
+  - Processing a smaller image requires fewer calculations compared to a larger one. This makes the network more efficient, especially when dealing with high-resolution images.
+
+#### Bottleneck
+
+  ```py
+     self.bottleneck = SwitchSequential(
+            # (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            UNET_ResidualBlock(1280, 1280),
+
+            # (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            UNET_AttentionBlock(8, 160),
+
+            # (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            UNET_ResidualBlock(1280, 1280),
+        )
+  ```
+
+- The bottleneck is a specific section in the U-Net where the image size reaches its minimum value.
+- The bottleneck is a special block that processes the features from the final encoder.
+- This design choice aims to capture the most critical and abstract features of the input image in a compressed representation within the bottleneck.
+
+#### Decoder
+
+  ```py
+    self.decoders = nn.ModuleList([
+            # (Batch_Size, 2560, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
+
+            # (Batch_Size, 2560, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
+            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
+
+            # (Batch_Size, 2560, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), Upsample(1280)),
+
+            # (Batch_Size, 2560, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
+
+            # (Batch_Size, 2560, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
+
+            # (Batch_Size, 1920, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(1920, 1280), UNET_AttentionBlock(8, 160), Upsample(1280)),
+
+            # (Batch_Size, 1920, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(1920, 640), UNET_AttentionBlock(8, 80)),
+
+            # (Batch_Size, 1280, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(1280, 640), UNET_AttentionBlock(8, 80)),
+
+            # (Batch_Size, 960, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(960, 640), UNET_AttentionBlock(8, 80), Upsample(640)),
+
+            # (Batch_Size, 960, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(960, 320), UNET_AttentionBlock(8, 40)),
+
+            # (Batch_Size, 640, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
+
+            # (Batch_Size, 640, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
+        ])
+  ```
+
+- The decoders module list is similar to the encoders but in reverse order.
+- It uses residual blocks, attention blocks, and upsampling (increases size) to reconstruct a detailed output.
+- During decoding, skip connections from the encoders are concatenated with the decoder outputs, allowing the network to recover spatial information lost during downsampling.
+
+#### What is SwitchSequential block?
+
+  ```py
+    class SwitchSequential(nn.Sequential):
+    def forward(self, x, context, time):
+        for layer in self:
+            if isinstance(layer, UNET_AttentionBlock):
+                x = layer(x, context)
+            elif isinstance(layer, UNET_ResidualBlock):
+                x = layer(x, time)
+            else:
+                x = layer(x)
+        return x
+  ```
+
+Similar to nn.Sequential, it takes an ordered list off layers as input during its initialization. During the forward pass, it iterates through this list, applying each layer's operation to the input data sequentially. It can recognize what are the parameters of each of them, and we'll apply accordingly.
 
 
 
@@ -519,3 +700,21 @@ We give the U-Net not only the noisified image but also the time Step At which i
 ### Clip Model
 
 <https://sh-tsang.medium.com/review-pre-ln-transformer-on-layer-normalization-in-the-transformer-architecture-b6c91a89e9ab>
+
+<https://medium.com/one-minute-machine-learning/clip-paper-explained-easily-in-3-levels-of-detail-61959814ad13>
+
+
+### U-Net
+<https://idiotdeveloper.com/attention-unet-and-its-implementation-in-tensorflow/>
+#### interpolation and resampling: https://www.youtube.com/watch?v=rLMznzIslVA
+
+Note: We generate noise in pipeline
+
+
+VAEs work on learning how to compress the image and recover it. A variational autoencoder can be defined as being an autoencoder whose training is regularised to avoid overfitting and ensure that the latent space has good properties that enable generative process.
+
+U-Nets work on analyzing images for segmentation and feature extraction while maintaining image size. The architecture of U-Net is unique in that it consists of a contracting path and an expansive path. The contracting path contains encoder layers that capture contextual information and reduce the spatial resolution of the input, while the expansive path contains decoder layers that decode the encoded data and use the information from the contracting path via skip connections to generate a segmentation map.
+
+So VAE is the model that tries to compress the data while also preserving the features of the data. But U-Net focuses on analyzing and attending to the data while maintaining image size. 
+
+
