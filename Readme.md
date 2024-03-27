@@ -771,7 +771,10 @@ It uses to project the input features (x) to a higher dimension, essentially cre
    ```py
     x = x * F.gelu(gate)
   ```
-   This part introduces non-linearity. The erf function ensures a smooth, non-zero slope for negative inputs. After this, using linear layer to projects output back to a suitable format for further processing.
+This part introduces non-linearity. The erf function ensures a smooth, non-zero slope for negative inputs. After this, using linear layer to projects output back to a suitable format for further processing.
+
+So, It first projects the image data to a higher-dimensional space, allowing for more complex feature extraction. It then uses GELU to selectively emphasize specific features based on their characteristics. Finally, it modulates the original features with these emphasized ones, potentially leading to a more robust representation of the objects.
+
 
 
 
