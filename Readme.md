@@ -790,6 +790,290 @@ Another advantage of GeGLU activations is their continuous differentiability. Th
 
 When juxtaposed with activation stalwarts like ReLU, GELU, Sigmoid, and Swish, GeGLU shines in its ability to balance range, nonlinearity, and training efficiency. This balance is crucial for the robust performance of neural networks across a plethora of tasks, from image recognition to language processing. (Gated Linear Unit with GELU activation)
 
+# Pipeline
+
+  ```py
+      with torch.no_grad():
+        if not 0 < strength <= 1:
+            raise ValueError("strength must be between 0 and 1")
+
+        if idle_device:
+            to_idle = lambda x: x.to(idle_device)
+        else:
+            to_idle = lambda x: x  
+  ```
+First, we need to disable gradient calculation for efficiency. When we are not training the model but generating image based on a trained model, gradient calculation becomes unnessary. Because we are not adjusting parameters anymore. We are just using the existing weights to make predictions generate images.
+
+1. strength parameter controls the amount of noise added during the initail 'diffusion' step. 
+     - 0 indicates no additional noise is added
+     - 1 indicates maximum level of noise is added
+
+2. if idle_device is creating for if we want to move thing to the cpu when we don't use it.
+
+  ```py
+      generator = torch.Generator(device=device)
+        if seed is None:
+            generator.seed()
+        else:
+            generator.manual_seed(seed)
+  ```
+
+3. This generator is the random number generator, and this number will use to generate noise.
+
+  ```py
+      clip = models["clip"]
+        clip.to(device)
+
+        if do_cfg:
+            # Convert into a list of length Seq_Len=77
+            cond_tokens = tokenizer.batch_encode_plus(
+                [prompt], padding="max_length", max_length=77
+            ).input_ids
+            # (Batch_Size, Seq_Len)
+            cond_tokens = torch.tensor(cond_tokens, dtype=torch.long, device=device)
+            # (Batch_Size, Seq_Len) -> (Batch_Size, Seq_Len, Dim)
+            cond_context = clip(cond_tokens)
+            # Convert into a list of length Seq_Len=77
+            uncond_tokens = tokenizer.batch_encode_plus(
+                [uncond_prompt], padding="max_length", max_length=77
+            ).input_ids
+            # (Batch_Size, Seq_Len)
+            uncond_tokens = torch.tensor(uncond_tokens, dtype=torch.long, device=device)
+            # (Batch_Size, Seq_Len) -> (Batch_Size, Seq_Len, Dim)
+            uncond_context = clip(uncond_tokens)
+            # (Batch_Size, Seq_Len, Dim) + (Batch_Size, Seq_Len, Dim) -> (2 * Batch_Size, Seq_Len, Dim)
+            context = torch.cat([cond_context, uncond_context])
+        else:
+            # Convert into a list of length Seq_Len=77
+            tokens = tokenizer.batch_encode_plus(
+                [prompt], padding="max_length", max_length=77
+            ).input_ids
+            # (Batch_Size, Seq_Len)
+            tokens = torch.tensor(tokens, dtype=torch.long, device=device)
+            # (Batch_Size, Seq_Len) -> (Batch_Size, Seq_Len, Dim)
+            context = clip(tokens)
+        to_idle(clip)
+  ```
+
+1. Next, we move CLIP model to our device. Then, we will do CFG (Classifier Free Guidance). First, for the conditional_token, we tokenizes the provided text prompt using the tokenizer, then convert the token into number (tensor) using torch.tensor() and send it to clip model to do attention and other operations. For the unconditional token, we do same operation similar as conditional token, but the prompt that it use is the empty string which can convert to 0 in the tensor. Finally, we combine condition prompt and condition prompt. In the else statement, we just use only condition prompt.
+
+  ```py
+            if sampler_name == "ddpm":
+            sampler = DDPMSampler(generator)
+            sampler.set_inference_timesteps(n_inference_steps)
+        else:
+            raise ValueError("Unknown sampler value %s. ")
+
+        latents_shape = (1, 4, LATENTS_HEIGHT, LATENTS_WIDTH)
+  ```
+
+1. First, we pass the random noise generator to DDPMSampler, then we set the inference steps.
+
+  ```py
+      latents_shape = (1, 4, LATENTS_HEIGHT, LATENTS_WIDTH)
+  ```
+
+This is the latents that will run through the unit
+
+  ```py
+        if input_image:
+            encoder = models["encoder"]
+            encoder.to(device)
+
+            input_image_tensor = input_image.resize((WIDTH, HEIGHT))
+            # (Height, Width, Channel)
+            input_image_tensor = np.array(input_image_tensor)
+            # (Height, Width, Channel) -> (Height, Width, Channel)
+            input_image_tensor = torch.tensor(input_image_tensor, dtype=torch.float32, device=device)
+            # (Height, Width, Channel) -> (Height, Width, Channel)
+            input_image_tensor = rescale(input_image_tensor, (0, 255), (-1, 1))
+            # (Height, Width, Channel) -> (Batch_Size, Height, Width, Channel)
+            input_image_tensor = input_image_tensor.unsqueeze(0)
+            # (Batch_Size, Height, Width, Channel) -> (Batch_Size, Channel, Height, Width)
+            input_image_tensor = input_image_tensor.permute(0, 3, 1, 2)
+
+            # (Batch_Size, 4, Latents_Height, Latents_Width)
+            encoder_noise = torch.randn(latents_shape, generator=generator, device=device)
+            # (Batch_Size, 4, Latents_Height, Latents_Width)
+            latents = encoder(input_image_tensor, encoder_noise)
+
+            # Add noise to the latents (the encoded input image)
+            # (Batch_Size, 4, Latents_Height, Latents_Width)
+            sampler.set_strength(strength=strength)
+            latents = sampler.add_noise(latents, sampler.timesteps[0])
+
+            to_idle(encoder)
+        else:
+            # If we are doing text-to-Image, start with random noise N(0, I)
+            # (Batch_Size, 4, Latents_Height, Latents_Width)
+            latents = torch.randn(latents_shape, generator=generator, device=device)
+  ```
+
+
+1. Access and Prepare the Input Image:
+   - Retrieves the encoder model from the models dictionary.
+   - Moves the encoder model to the specified device (CPU or GPU) using to(device).
+   - Resizes the input image to match the expected width and height (WIDTH and HEIGHT).
+   - Converts the NumPy image array to a PyTorch tensor with data type torch.float32 and moves it to the device.
+   - Rescales the pixel values from the image's original range (likely 0-255) to the model's expected range (usually -1 to 1) using the rescale function.
+   - Expands the dimension of the tensor to add a batch dimension of size 1 (since we're processing a single image).
+   - Permutes the order of the dimensions to match the expected format for the encoder model (channels first - Batch, Channel, Height, Width).
+
+2. Encode the Image with Noise:
+   - Generates random noise with the same shape as the desired latent vector (latents_shape).
+   - Feeds the preprocessed input image tensor and the noise tensor to the encoder model.
+   - The encoder likely processes the image and noise, resulting in a latent vector representing the encoded image with some noise added.
+
+3. Add Noise Based on Diffusion Step:
+   - Sets the noise strength for the diffusion sampler using set_strength.
+   - Adds noise to the encoded image (latents) based on the first timestep of the sampler using add_noise. This injects noise according to the current stage of the diffusion process.
+
+4. Move Encoder to Idle Device (if specified):
+   - If an idle_device is defined, the to_idle function likely moves the encoder model to that device to free up memory on the main device.
+
+  ```py
+    diffusion = models["diffusion"]
+        diffusion.to(device)
+
+        timesteps = tqdm(sampler.timesteps)
+        for i, timestep in enumerate(timesteps):
+            # (1, 320)
+            time_embedding = get_time_embedding(timestep).to(device)
+
+            # (Batch_Size, 4, Latents_Height, Latents_Width)
+            model_input = latents
+
+            if do_cfg:
+                # (Batch_Size, 4, Latents_Height, Latents_Width) -> (2 * Batch_Size, 4, Latents_Height, Latents_Width)
+                model_input = model_input.repeat(2, 1, 1, 1)
+
+            # model_output is the predicted noise
+            # (Batch_Size, 4, Latents_Height, Latents_Width) -> (Batch_Size, 4, Latents_Height, Latents_Width)
+            model_output = diffusion(model_input, context, time_embedding)
+
+            if do_cfg:
+                output_cond, output_uncond = model_output.chunk(2)
+                model_output = cfg_scale * (output_cond - output_uncond) + output_uncond
+
+            # (Batch_Size, 4, Latents_Height, Latents_Width) -> (Batch_Size, 4, Latents_Height, Latents_Width)
+            latents = sampler.step(timestep, latents, model_output)
+
+        to_idle(diffusion)
+  ```
+
+
+1. Access and Move Diffusion Model:
+
+   - Retrieves the diffusion model from the models dictionary.
+       Moves the diffusion model to the specified device (CPU or GPU) using to(device).
+
+2. Looping Through Diffusion Steps:
+
+   - The timesteps variable likely contains a list of values representing the different steps in the diffusion process.
+
+   - A tqdm progress bar is used to visualize the progress of the loop.
+
+   - The loop iterates over each timestep (i is the index, timestep is the actual value):
+
+     a. Time Embedding:
+     - Calls the get_time_embedding function (not shown in the provided code) to create a time embedding based on the current timestep. This embedding likely encodes information about the current stage of the diffusion process.
+     - Moves the time embedding to the device using to(device).
+
+     b. Model Input:
+     - The model_input is initially set to the current latent vector (latents). This vector represents the noisy image representation at the current step.
+
+     c. Conditional Input (if do_cfg is True):
+     - If conditional generation is enabled (do_cfg is True), the code replicates the model_input to create a double batch size. This is likely because the diffusion model expects separate inputs for conditional and unconditional contexts.
+
+     d. Predict Noise:
+     - The diffusion model is called with the model_input (potentially containing both conditional and unconditional information), the context vector (context likely holds the encoded text prompt), and the time embedding.
+     - The output (model_output) is the predicted noise for the current step, which the model will use to refine the latent vector.
+
+     e. Conditional Output Processing (if do_cfg is True):
+     - If conditional generation is enabled, the code splits the model_output into two parts: output_cond (conditional) and output_uncond (unconditional).
+     - It then calculates a weighted difference between the conditional and unconditional outputs, scaled by the cfg_scale factor. This likely emphasizes the influence of the conditional prompt on the generated image.
+     - The final model_output is then a combination of the weighted difference and the unconditional output.
+
+     f. Update Latent Vector:
+     - The sampler.step function is called with the current timestep, the current latent vector (latents), and the predicted noise (model_output).
+     - This step function likely uses the information to update the latent vector, incorporating the predicted noise and progressing the image towards a higher fidelity version. It use to remove noise predicted by U-net.
+
+3. Move Diffusion Model to Idle Device (if specified):
+
+   - If an idle_device is defined, the to_idle function likely moves the diffusion model to that device to free up memory on the main device after the loop completes.
+
+
+  ```py
+    decoder = models["decoder"]
+        decoder.to(device)
+        # (Batch_Size, 4, Latents_Height, Latents_Width) -> (Batch_Size, 3, Height, Width)
+        images = decoder(latents)
+        to_idle(decoder)
+
+        images = rescale(images, (-1, 1), (0, 255), clamp=True)
+        # (Batch_Size, Channel, Height, Width) -> (Batch_Size, Height, Width, Channel)
+        images = images.permute(0, 2, 3, 1)
+        images = images.to("cpu", torch.uint8).numpy()
+        return images[0]
+  ```
+
+1. Access and Move Decoder Model:
+     - Retrieves the decoder model from the models dictionary.
+     - Moves the decoder model to the specified device (CPU or GPU) using to(device).
+
+2. Decoding Latent Vector:
+     - Feeds the final latent vector (latents) obtained after the diffusion loop to the decoder model.
+     - The decoder likely takes the latent noise vector, which encodes the image information, and transforms it into an actual image representation.
+     - The output (images) from the decoder is likely a tensor with the shape (Batch_Size, Channel, Height, Width).
+
+3. Move Decoder to Idle Device (if specified):
+      - If an idle_device is defined, the to_idle function likely moves the decoder model to that device to free up memory on the main device after processing.
+
+4. Rescale Pixel Values:
+    - The rescale function is used to convert the pixel values in the image tensor from the model's output range (likely -1 to 1) to the desired image range (usually 0 to 255).
+    - The clamp=True argument in rescale ensures that any values outside the desired range are clipped to the boundaries (0 or 255 in this case).
+
+5. Change Channel Order:
+    - The .permute(0, 2, 3, 1) operation swaps the order of the dimensions in the image tensor.
+    - Originally: (Batch_Size, Channel, Height, Width) (channels first)
+    - After permutation: (Batch_Size, Height, Width, Channel) (channels last) - This format is more common for image data in NumPy arrays.
+
+6. Convert to NumPy Array:
+    - The image tensor is moved to the CPU using to("cpu").
+    - The data type is converted to torch.uint8 (unsigned 8-bit integers) which is a common format for image data representing pixel intensities (0-255).
+    - Finally, the tensor is converted to a NumPy array using .numpy().
+
+7. Return Image (assuming batch size 1):
+    - Since we're likely generating a single image based on the prompt, the code retrieves the first element from the batch dimension (index 0) using images[0]. This extracts the actual image data from the potentially batched tensor.
+    - The function then returns this processed image array.
+
+
+
+## Sampler
+
+Stable Diffusion utilizes a diffusion model. This model starts with a latent noise vector representing random noise. Over multiple steps, the diffusion process gradually removes this noise, revealing the desired image.
+
+Sampler's Role:
+
+The sampler controls how noise is added and removed during each diffusion step. It achieves this in two key ways:
+  - Adding Noise:
+    - At the beginning of each step, the sampler injects noise into the current latent vector. This initial noise provides a starting point for the image and helps explore different possibilities.
+    - The amount of noise added might be controlled by a strength parameter or might be determined based on the current step in the diffusion process.-
+  - Predicting Noise:
+    - As the diffusion model processes the latent vector with noise, it predicts the "noise to be removed" at the current step.
+    - The sampler then uses this predicted noise to update the latent vector, essentially removing the predicted noise component and progressing the image towards a clearer representation.
+
+Sampler Types:
+
+Stable Diffusion typically uses the DDPM sampler (Denoising Diffusion Probabilistic Model). This sampler relies on a probabilistic approach to predict the noise to be removed at each step. However, other sampler types might also be supported depending on the specific implementation.
+
+Impact on Image Quality and Creativity:
+
+  - The choice of sampler and its configuration can significantly impact the quality and style of the generated images.
+  - Different samplers might introduce noise in different ways, leading to variations in image texture and detail.
+  - The amount of noise added and removed during each step can influence the level of detail and smoothness in the final image.
+  - Some samplers might be better suited for achieving high-fidelity images, while others might be more effective for generating creative and artistic outputs
+
 # Reference
 
 ### Residual Block
@@ -828,3 +1112,8 @@ So VAE is the model that tries to compress the data while also preserving the fe
 
 ### GeGLU
 <https://medium.com/@juanc.olamendy/unlocking-the-power-of-geglu-advanced-activation-functions-in-deep-learning-444868d6d89c>
+
+### Sampler
+
+<https://getimg.ai/guides/guide-to-stable-diffusion-samplers>
+<https://gilgam3sh.medium.com/tutorial-what-is-a-sampler-in-stable-diffusion-d5c16875b898>

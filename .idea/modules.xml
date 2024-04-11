@@ -2,6 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/../../CyberSecurity/Playfair_Algorithm/.idea/Playfair_Algorithm.iml" filepath="$PROJECT_DIR$/../../CyberSecurity/Playfair_Algorithm/.idea/Playfair_Algorithm.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/STABLE-DIFFUSION.iml" filepath="$PROJECT_DIR$/.idea/STABLE-DIFFUSION.iml" />
     </modules>
   </component>
